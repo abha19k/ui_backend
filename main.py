@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -15,18 +15,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from starlette.staticfiles import StaticFiles
-from typing import Union
 
-# === External forecaster ======================================================
-from my_forecast_xgb import forecast_xgb
+# === Load forecast modules for all periods ===================================
 
-# (optional) 18m batch script
-_BF_PATH = Path(__file__).with_name("forecast_18m_multi_models_backtest_with_plots_pi.py")
-bf = None
+# Daily: 7-day horizon script (assumed similar API to monthly)
+_DAILY_PATH = Path(__file__).with_name("forecast_7d_multi_models_backtest_with_plots_pi.py")
+daily_mod = None
 try:
-    bf = SourceFileLoader("batch18m_mod", str(_BF_PATH)).load_module()  # type: ignore
+    daily_mod = SourceFileLoader("batch7d_mod", str(_DAILY_PATH)).load_module()  # type: ignore
 except Exception as _e:
-    logging.getLogger("uvicorn.error").warning("Batch script import failed: %s", _e)
+    logging.getLogger("uvicorn.error").warning("Daily batch script import failed: %s", _e)
+
+# Weekly: 13-week horizon script
+_WEEKLY_PATH = Path(__file__).with_name("forecast_13w_multi_models_backtest_with_plots_pi.py")
+weekly_mod = None
+try:
+    weekly_mod = SourceFileLoader("batch13w_mod", str(_WEEKLY_PATH)).load_module()  # type: ignore
+except Exception as _e:
+    logging.getLogger("uvicorn.error").warning("Weekly batch script import failed: %s", _e)
+
+# Monthly: 18-month horizon script
+_MONTHLY_PATH = Path(__file__).with_name("forecast_18m_multi_models_backtest_with_plots_pi.py")
+bf = None  # monthly module
+try:
+    bf = SourceFileLoader("batch18m_mod", str(_MONTHLY_PATH)).load_module()  # type: ignore
+except Exception as _e:
+    logging.getLogger("uvicorn.error").warning("Monthly batch script import failed: %s", _e)
+
+# Helper: map period -> module
+def _get_forecast_module(period: Literal["daily", "weekly", "monthly"]):
+    if period == "daily":
+        if daily_mod is None:
+            raise HTTPException(status_code=400, detail="Daily forecast module not available on server.")
+        return daily_mod
+    if period == "weekly":
+        if weekly_mod is None:
+            raise HTTPException(status_code=400, detail="Weekly forecast module not available on server.")
+        return weekly_mod
+    # monthly
+    if bf is None:
+        raise HTTPException(status_code=400, detail="Monthly forecast module not available on server.")
+    return bf
+
 
 # === App & CORS ===============================================================
 app = FastAPI()
@@ -71,6 +101,7 @@ def _period_end(sdt: datetime, period: Literal["daily", "weekly", "monthly"]) ->
         return sdt
     if period == "weekly":
         return sdt + timedelta(days=6)
+    # monthly
     return (sdt.replace(day=1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
 
 
@@ -185,7 +216,9 @@ def _build_where_clause_with_map(q: str, params: dict, field_map: Dict[str, str]
 # === Startup DDL & indexes ====================================================
 @app.on_event("startup")
 def startup_ddl():
-    logging.getLogger("uvicorn.error").info("Forecaster: %s", forecast_xgb.__module__)
+    logging.getLogger("uvicorn.error").info("Daily module: %s", getattr(daily_mod, "__name__", "unavailable"))
+    logging.getLogger("uvicorn.error").info("Weekly module: %s", getattr(weekly_mod, "__name__", "unavailable"))
+    logging.getLogger("uvicorn.error").info("Monthly module: %s", getattr(bf, "__name__", "unavailable"))
     with engine.begin() as c:
         # saved searches
         c.execute(text("""
@@ -233,7 +266,7 @@ def startup_ddl():
         CREATE UNIQUE INDEX IF NOT EXISTS ux_forecast_monthly_xgb
           ON forecast_monthly("ProductID","ChannelID","LocationID","StartDate","EndDate","Method");
         """))
-        # cleanse_profile with settings+config not null
+        # cleanse_profile
         c.execute(text("""
         CREATE TABLE IF NOT EXISTS cleanse_profile (
           id SERIAL PRIMARY KEY,
@@ -512,7 +545,7 @@ def history_series_by_query(
     return fetch_all(sql, params)
 
 
-# === Forecast series by query (charts) ========================================
+# === Forecast series by query (charts, using forecast_* tables) ==============
 @app.get("/api/forecast/{bucket}-series-by-query")
 def forecast_series_by_query(
     bucket: Literal["daily", "weekly", "monthly"],
@@ -665,425 +698,6 @@ def _load_series_for_key(
     return s, used_cleansed, pd_freq, trunc_part
 
 
-# === Forecast (run / aggregate / backtest / tune) =============================
-class XGBPrediction(BaseModel):
-    ProductID: str
-    ChannelID: str
-    LocationID: str
-    StartDate: str
-    EndDate: str
-    Qty: float
-    Method: str
-    Period: str
-    Type: str
-
-
-class XGBRunBody(BaseModel):
-    period: Literal["daily", "weekly", "monthly"]
-    key: KeyTriplet
-    horizon: int = 12
-    lag: int = 3
-    use_cleansed: bool = False
-    save: bool = False
-    use_generated_periods: bool = True
-    params: Optional[Dict[str, Any]] = None
-    features: Optional[Dict[str, Any]] = None
-
-
-class XGBRunResult(BaseModel):
-    period: str
-    horizon: int
-    used_cleansed: bool
-    key: KeyTriplet
-    history_points: int
-    predictions: List[XGBPrediction]
-
-
-class XGBAggregateRunBody(BaseModel):
-    period: Literal["daily", "weekly", "monthly"]
-    q: str
-    horizon: int = 12
-    lag: int = 3
-    use_cleansed: bool = False
-    use_generated_periods: bool = True
-    params: Optional[Dict[str, Any]] = None
-    features: Optional[Dict[str, Any]] = None
-    max_keys: int = 200
-
-
-def _default_params() -> Dict[str, Any]:
-    return {
-        "n_estimators": 300,
-        "learning_rate": 0.05,
-        "max_depth": 5,
-        "subsample": 0.9,
-        "colsample_bytree": 0.8,
-        "random_state": 42,
-    }
-
-
-@app.post("/api/forecast/xgb/run", response_model=XGBRunResult)
-def forecast_xgb_run(body: XGBRunBody):
-    period = body.period
-    pid, cid, lid = body.key.ProductID, body.key.ChannelID, body.key.LocationID
-    series, used_cleansed, _, _ = _load_series_for_key(period, pid, cid, lid, body.use_cleansed)
-
-    H = int(max(1, body.horizon))
-    lag = int(max(1, body.lag))
-    if len(series) < lag + 1:
-        raise HTTPException(status_code=400, detail=f"Not enough history (have {len(series)}, need {lag+1}).")
-
-    future_periods: List[Tuple[datetime, datetime]] = []
-    if body.use_generated_periods:
-        last_dt = series.index.max().to_pydatetime()
-        future_periods = _load_generated_periods(period, last_dt)
-        if future_periods:
-            H = len(future_periods)
-
-    params = _default_params()
-    params.update(body.params or {})
-
-    fc_vals = forecast_xgb(series, H, lag=lag, params=params)
-
-    preds: List[XGBPrediction] = []
-    if future_periods:
-        for i, (sdt, edt) in enumerate(future_periods):
-            preds.append(XGBPrediction(
-                ProductID=pid, ChannelID=cid, LocationID=lid,
-                StartDate=sdt.strftime("%Y-%m-%dT00:00:00Z"),
-                EndDate=(edt.strftime("%Y-%m-%dT23:59:59Z") if period != "daily" else sdt.strftime("%Y-%m-%dT00:00:00Z")),
-                Qty=float(fc_vals[i]), Method="XGBoost", Period=period.capitalize(), Type="Algorithm-Forecast",
-            ))
-    else:
-        last_dt = series.index.max().to_pydatetime()
-        step = _period_delta(period)
-        for i in range(H):
-            sdt = last_dt + (i + 1) * step
-            edt = _period_end(sdt, period)
-            preds.append(XGBPrediction(
-                ProductID=pid, ChannelID=cid, LocationID=lid,
-                StartDate=sdt.strftime("%Y-%m-%dT00:00:00Z"),
-                EndDate=(edt.strftime("%Y-%m-%dT23:59:59Z") if period != "daily" else sdt.strftime("%Y-%m-%dT00:00:00Z")),
-                Qty=float(fc_vals[i]), Method="XGBoost", Period=period.capitalize(), Type="Algorithm-Forecast",
-            ))
-
-    if body.save:
-        tbl = _forecast_table(period)
-        sql_ins = f"""
-        INSERT INTO {tbl}
-          ("ProductID","ChannelID","LocationID","StartDate","EndDate","Qty","Level","Period","Method","Type")
-        VALUES
-          (:ProductID,:ChannelID,:LocationID,:StartDate,:EndDate,:Qty,'Item','{period.capitalize()}','XGBoost','Algorithm-Forecast')
-        ON CONFLICT ("ProductID","ChannelID","LocationID","StartDate","EndDate","Method")
-        DO UPDATE SET "Qty"=EXCLUDED."Qty","Type"=EXCLUDED."Type";
-        """
-        with engine.begin() as c:
-            c.execute(text(sql_ins), [p.dict() for p in preds])
-
-    return XGBRunResult(
-        period=period, horizon=len(preds), used_cleansed=used_cleansed,
-        key=body.key, history_points=int(len(series)), predictions=preds,
-    )
-
-
-@app.post("/api/forecast/xgb/aggregate-by-query", response_model=List[SeriesPoint])
-def forecast_xgb_aggregate_by_query(body: XGBAggregateRunBody):
-    period = body.period
-    params: Dict[str, Any] = {}
-    where_sql = _build_where_clause_with_map(body.q or "", params, FIELD_MAP, "b")
-    params["max_keys"] = max(1, int(body.max_keys))
-    keys_sql = f"""
-      SELECT DISTINCT fe."ProductID", fe."ChannelID", fe."LocationID"
-      FROM forecast_element fe
-      LEFT JOIN product  p ON p."ProductID"  = fe."ProductID"
-      LEFT JOIN channel  c ON c."ChannelID"  = fe."ChannelID"
-      LEFT JOIN location l ON l."LocationID" = fe."LocationID"
-      WHERE {where_sql}
-      LIMIT :max_keys
-    """
-    rows = fetch_all(keys_sql, params)
-    if not rows:
-        raise HTTPException(status_code=400, detail="No keys matched this query.")
-    keys: List[KeyTriplet] = [KeyTriplet(**r) for r in rows]
-
-    series_list: List[pd.Series] = []
-    max_last_dt: Optional[datetime] = None
-    for k in keys:
-        try:
-            y, _, _, _ = _load_series_for_key(period, k.ProductID, k.ChannelID, k.LocationID, body.use_cleansed)
-        except HTTPException:
-            continue
-        if len(y) == 0:
-            continue
-        series_list.append(y)
-        last_dt = y.index.max().to_pydatetime()
-        max_last_dt = last_dt if (max_last_dt is None or last_dt > max_last_dt) else max_last_dt
-
-    if not series_list or max_last_dt is None:
-        raise HTTPException(status_code=400, detail="No usable history for matched keys.")
-
-    H = int(max(1, body.horizon))
-    future_periods: List[Tuple[datetime, datetime]] = []
-    if body.use_generated_periods:
-        future_periods = _load_generated_periods(period, max_last_dt)
-        if future_periods:
-            H = len(future_periods)
-
-    params_x = _default_params()
-    params_x.update(body.params or {})
-    lag = int(max(1, body.lag))
-
-    agg = np.zeros(H, dtype=float)
-    for s in series_list:
-        if len(s) < lag + 1:
-            continue
-        fc = forecast_xgb(s, H, lag=lag, params=params_x)
-        if len(fc) < H:
-            tmp = np.zeros(H, dtype=float)
-            tmp[: len(fc)] = fc
-            fc = tmp
-        agg += np.asarray(fc, dtype=float)
-
-    out: List[SeriesPoint] = []
-    if future_periods:
-        for i, (sdt, _) in enumerate(future_periods[:H]):
-            out.append(SeriesPoint(StartDate=sdt.strftime("%Y-%m-%dT00:00:00Z"), Qty=float(agg[i])))
-    else:
-        step = _period_delta(period)
-        for i in range(H):
-            sdt = max_last_dt + (i + 1) * step
-            out.append(SeriesPoint(StartDate=sdt.strftime("%Y-%m-%dT00:00:00Z"), Qty=float(agg[i])))
-
-    return out
-
-
-# ---- Backtest / Tune ---------------------------------------------------------
-class XGBBacktestBody(BaseModel):
-    period: Literal["daily", "weekly", "monthly"]
-    key: KeyTriplet
-    horizon: int = 12
-    lag: int = 3
-    folds: int = 3
-    use_cleansed: bool = False
-    params: Optional[Dict[str, Any]] = None
-    features: Optional[Dict[str, Any]] = None
-
-
-class XGBBacktestResult(BaseModel):
-    metrics: Dict[str, float]
-
-
-def _mae(y, yhat): return float(np.mean(np.abs(y - yhat))) if len(y) else float("inf")
-def _rmse(y, yhat): return float(np.sqrt(np.mean((y - yhat) ** 2))) if len(y) else float("inf")
-def _mape(y, yhat):
-    y = np.asarray(y, dtype=float); yhat = np.asarray(yhat, dtype=float)
-    mask = y != 0
-    return float(np.mean(np.abs((yhat[mask] - y[mask]) / y[mask])) * 100.0) if mask.any() else float("inf")
-def _smape(y, yhat):
-    y = np.asarray(y, dtype=float); yhat = np.asarray(yhat, dtype=float)
-    denom = (np.abs(y) + np.abs(yhat)); mask = denom != 0
-    return float(np.mean(200.0 * np.abs(yhat[mask] - y[mask]) / denom[mask])) if mask.any() else float("inf")
-def _wape(y, yhat):
-    y = np.asarray(y, dtype=float); yhat = np.asarray(yhat, dtype=float)
-    denom = np.sum(np.abs(y))
-    return float(np.sum(np.abs(yhat - y)) / denom * 100.0) if denom > 0 else float("inf")
-
-
-@app.post("/api/forecast/xgb/backtest", response_model=XGBBacktestResult)
-def forecast_xgb_backtest(body: XGBBacktestBody):
-    pid, cid, lid = body.key.ProductID, body.key.ChannelID, body.key.LocationID
-    series, _, _, _ = _load_series_for_key(body.period, pid, cid, lid, body.use_cleansed)
-
-    y_full = series.astype(float).values
-    N = len(y_full)
-    H = int(max(1, body.horizon))
-    K = int(max(1, body.folds))
-    lag = int(max(1, body.lag))
-
-    if N < lag + 1:
-        raise HTTPException(status_code=400, detail=f"Not enough history (have {N}, need {lag+1}).")
-
-    params = _default_params()
-    params.update(body.params or {})
-
-    maes = []; rmses = []; mapes_list = []; smapes = []; wapes = []
-    for f in range(K):
-        cut = N - (K - f) * H
-        if cut <= max(lag + 2, 10):
-            break
-        y_train = y_full[:cut]
-        y_test = y_full[cut : min(cut + H, N)]
-        if len(y_test) < 1:
-            break
-        s_train = pd.Series(y_train, index=series.index[:cut])
-        yhat = forecast_xgb(s_train, horizon=len(y_test), lag=lag, params=params)
-        m = min(len(yhat), len(y_test))
-        yhat = np.asarray(yhat[:m], dtype=float)
-        ycmp = np.asarray(y_test[:m], dtype=float)
-        maes.append(_mae(ycmp, yhat)); rmses.append(_rmse(ycmp, yhat))
-        mapes_list.append(_mape(ycmp, yhat)); smapes.append(_smape(ycmp, yhat)); wapes.append(_wape(ycmp, yhat))
-
-    if not maes:
-        raise HTTPException(status_code=400, detail="Not enough history for backtest.")
-
-    metrics = {
-        "MAE": float(np.mean(maes)),
-        "RMSE": float(np.mean(rmses)),
-        "MAPE": float(np.mean(mapes_list)),
-        "sMAPE": float(np.mean(smapes)),
-        "WAPE": float(np.mean(wapes)),
-    }
-    return XGBBacktestResult(metrics=metrics)
-
-
-class XGBTuneBody(BaseModel):
-    period: Literal["daily", "weekly", "monthly"]
-    key: KeyTriplet
-    horizon: int = 12
-    folds: int = 3
-    use_cleansed: bool = False
-    params_grid: Optional[Dict[str, List[Any]]] = None
-    features_grid: Optional[Dict[str, List[Any]]] = None
-    lags: Optional[List[int]] = None
-    max_configs: int = 36
-
-
-class TuneConfigScore(BaseModel):
-    lag: int
-    params: Dict[str, Any]
-    features: Dict[str, Any]
-    MAE: float
-    RMSE: float
-    MAPE: float
-    sMAPE: float
-    WAPE: float
-
-
-class XGBTuneResult(BaseModel):
-    tried: int
-    results: List[TuneConfigScore]
-    best: Optional[TuneConfigScore] = None
-
-
-def _default_tune_space(period: str):
-    if period == "daily": lags = [7, 14, 28]
-    elif period == "weekly": lags = [8, 13, 26]
-    else: lags = [6, 12]
-    params_grid = {
-        "n_estimators": [200, 400, 600],
-        "learning_rate": [0.03, 0.05, 0.1],
-        "max_depth": [3, 5, 7],
-        "subsample": [0.9],
-        "colsample_bytree": [0.8],
-        "random_state": [42],
-    }
-    return lags, params_grid
-
-
-@app.post("/api/forecast/xgb/tune", response_model=XGBTuneResult)
-def forecast_xgb_tune(body: XGBTuneBody):
-    pid, cid, lid = body.key.ProductID, body.key.ChannelID, body.key.LocationID
-    series, _, _, _ = _load_series_for_key(body.period, pid, cid, lid, body.use_cleansed)
-
-    y_full = series.astype(float).values
-    N = len(y_full)
-    H = int(max(1, body.horizon))
-    K = int(max(1, body.folds))
-
-    def_lags, def_pg = _default_tune_space(body.period)
-    lags = body.lags or def_lags
-    pg = {**def_pg, **(body.params_grid or {})}
-
-    p_keys, p_vals = zip(*pg.items())
-    from itertools import product as _prod
-    combos: List[Tuple[int, Dict[str, Any]]] = []
-    for lag in lags:
-        for choice in _prod(*p_vals):
-            params = dict(zip(p_keys, choice))
-            combos.append((int(lag), params))
-    combos = combos[: max(1, int(body.max_configs))]
-
-    results: List[TuneConfigScore] = []
-    for lag, params in combos:
-        maes=[]; rmses=[]; mapes=[]; smapes=[]; wapes=[]; ok=True
-        for f in range(K):
-            cut = N - (K - f) * H
-            if cut <= max(lag + 2, 10): ok=False; break
-            y_train = y_full[:cut]; y_test = y_full[cut: min(cut + H, N)]
-            if len(y_test) < 1: ok=False; break
-            s_train = pd.Series(y_train, index=series.index[:cut])
-            try:
-                yhat = forecast_xgb(s_train, horizon=len(y_test), lag=lag, params=params)
-            except Exception:
-                ok=False; break
-            m = min(len(yhat), len(y_test))
-            if m == 0: ok=False; break
-            yhat = np.asarray(yhat[:m], dtype=float); ycmp = np.asarray(y_test[:m], dtype=float)
-            maes.append(_mae(ycmp, yhat)); rmses.append(_rmse(ycmp, yhat))
-            mapes.append(_mape(ycmp, yhat)); smapes.append(_smape(ycmp, yhat)); wapes.append(_wape(ycmp, yhat))
-        if not ok or not maes: continue
-        results.append(TuneConfigScore(
-            lag=lag, params=params, features={},
-            MAE=float(np.mean(maes)), RMSE=float(np.mean(rmses)),
-            MAPE=float(np.mean(mapes)), sMAPE=float(np.mean(smapes)), WAPE=float(np.mean(wapes))
-        ))
-
-    results.sort(key=lambda r: (r.WAPE, r.sMAPE, r.RMSE))
-    best = results[0] if results else None
-    return XGBTuneResult(tried=len(combos), results=results[:10], best=best)
-
-
-# === History BY KEYS (table view) ============================================
-class HistoryKeysBody(BaseModel):
-    keys: List[KeyTriplet]
-
-
-@app.post("/api/history/{bucket}-by-keys")
-def history_by_keys(bucket: Literal["daily","weekly","monthly"], body: HistoryKeysBody):
-    hist_table, _, trunc_part = _tbl_freq(bucket)
-    period_label = bucket.capitalize()
-
-    if not body.keys:
-        return []
-
-    params: Dict[str, Any] = {"trunc_part": trunc_part, "period_label": period_label}
-    vals: List[str] = []
-    for i, k in enumerate(body.keys):
-        params[f"p{i}"] = k.ProductID
-        params[f"c{i}"] = k.ChannelID
-        params[f"l{i}"] = k.LocationID
-        vals.append(f"(:p{i}, :c{i}, :l{i})")
-    vals_sql = ",".join(vals)
-
-    sql = f"""
-    WITH keys(ProductID, ChannelID, LocationID) AS ( VALUES {vals_sql} ),
-    src AS (
-      SELECT h."ProductID", h."ChannelID", h."LocationID",
-             date_trunc(:trunc_part, {_ts_expr('h')}) AS dt,
-             SUM(h."Qty")::float AS qty
-      FROM {hist_table} h
-      JOIN keys k
-        ON h."ProductID" = k.ProductID
-       AND h."ChannelID" = k.ChannelID
-       AND h."LocationID" = k.LocationID
-      WHERE {_ts_expr('h')} IS NOT NULL
-      GROUP BY 1,2,3,4
-    )
-    SELECT s."ProductID" AS "ProductID",
-           s."ChannelID" AS "ChannelID",
-           s."LocationID" AS "LocationID",
-           :period_label   AS "Period",
-           to_char(s.dt, 'YYYY-MM-DD"T"00:00:00"Z"') AS "StartDate",
-           to_char(s.dt, 'YYYY-MM-DD"T"00:00:00"Z"') AS "EndDate",
-           s.qty::text AS "Qty",
-           'Normal-History' AS "Type",
-           'Item' AS "Level"
-    FROM src s
-    ORDER BY s."ProductID", s."ChannelID", s."LocationID", s.dt;
-    """
-    return fetch_all(sql, params)
-
-
 # === Cleanse Profiles (list + upsert) ========================================
 class CleanseProfile(BaseModel):
     id: Optional[int] = None
@@ -1139,7 +753,7 @@ def cleanse_profiles_upsert(profile: CleanseProfile = Body(...)):
     return r
 
 
-# (Optional) Ingest cleansed history rows (UI can call this if needed)
+# (Optional) Ingest cleansed history rows
 class IngestRow(BaseModel):
     ProductID: str
     ChannelID: str
@@ -1150,20 +764,11 @@ class IngestRow(BaseModel):
 
 @app.post("/api/history/ingest-cleansed")
 def history_ingest_cleansed(body: Union[List[IngestRow], IngestRow, dict] = Body(...)):
-    """
-    Accepts:
-      - [ {row}, {row}, ... ]
-      - {row}
-      - { "rows": [ {row}, ... ] }
-    Coerces Qty to float, Period to Daily/Weekly/Monthly (case-insensitive).
-    """
-    # Normalize to a list of dicts
     if isinstance(body, list):
         raw_items = body
     elif isinstance(body, dict):
         raw_items = body.get("rows") if isinstance(body.get("rows"), list) else [body]
     else:
-        # Pydantic model instance
         raw_items = [body]  # type: ignore
 
     if not raw_items:
@@ -1184,25 +789,21 @@ def history_ingest_cleansed(body: Union[List[IngestRow], IngestRow, dict] = Body
     for i, item in enumerate(raw_items):
         try:
             d = item.dict() if isinstance(item, IngestRow) else dict(item)  # type: ignore
-            # Coerce/rename common variants
             if "startdate" in d and "StartDate" not in d:
                 d["StartDate"] = d.pop("startdate")
             if "qty" in d and "Qty" not in d:
                 d["Qty"] = d.pop("qty")
 
-            # Force required fields presence
             req = ["ProductID", "ChannelID", "LocationID", "StartDate", "Qty"]
             missing = [k for k in req if k not in d or d[k] in (None, "")]
             if missing:
                 raise ValueError(f"missing fields: {', '.join(missing)}")
 
-            # Coerce Qty
             try:
                 d["Qty"] = float(d["Qty"])
             except Exception:
                 raise ValueError("Qty must be numeric")
 
-            # Normalize Period
             d["Period"] = _norm_period(d.get("Period"))
 
             normalized.append(IngestRow(**d))
@@ -1212,7 +813,6 @@ def history_ingest_cleansed(body: Union[List[IngestRow], IngestRow, dict] = Body
     if errors and not normalized:
         raise HTTPException(status_code=400, detail="; ".join(errors))
 
-    # Group by bucket
     groups: Dict[str, List[Dict[str, Any]]] = {"daily": [], "weekly": [], "monthly": []}
     for r in normalized:
         bucket = r.Period.lower()
@@ -1314,7 +914,7 @@ def classify_results(period: Literal["daily","weekly","monthly"], include_inacti
     return fetch_all(sql.format(filt=filt), {"p": period})
 
 
-# === Batch 18M (optional) =====================================================
+# === Batch 18M (monthly CSV-driven) ==========================================
 def _parse_dt_dmy(s: pd.Series | str):
     if isinstance(s, str):
         return pd.to_datetime(s, dayfirst=True, errors="coerce")
@@ -1466,3 +1066,262 @@ def api_batch_forward_series(pid: str, cid: str, lid: str):
     grp = (sub.groupby("StartDate", as_index=False)["ForecastQty"].sum()
            .sort_values("StartDate"))
     return [SeriesPoint(StartDate=r["StartDate"], Qty=float(r["ForecastQty"])) for _, r in grp.iterrows()]
+
+
+# === Shared horizon defaults per period ======================================
+DEFAULT_HORIZON: Dict[str, int] = {
+    "daily": 7,      # next 7 days
+    "weekly": 13,    # next 13 weeks
+    "monthly": 18,   # next 18 months
+}
+
+
+# === NEW: Per-key forecast from DB history (all periods) =====================
+class Run18mBody(BaseModel):
+    key: KeyTriplet
+    period: Literal["daily", "weekly", "monthly"] = "monthly"
+    horizon: int = 18         # interpreted as "buckets"; we override default per period if needed
+    save: bool = False        # if true, upsert into forecast_* table
+    use_cleansed: bool = False  # reserved for future use
+
+
+class Run18mPrediction(BaseModel):
+    ProductID: str
+    ChannelID: str
+    LocationID: str
+    StartDate: str
+    EndDate: str
+    Qty: float
+    Method: str
+    Period: str
+    Type: str
+
+
+class Run18mResult(BaseModel):
+    key: KeyTriplet
+    period: Literal["daily", "weekly", "monthly"] = "monthly"
+    model: str
+    horizon: int
+    history_points: int
+    predictions: List[Run18mPrediction]
+
+
+# === NEW: Forecast aggregated by saved-search query (all periods) ============
+class Run18mByQueryBody(BaseModel):
+    q: Optional[str] = None
+    period: Literal["daily", "weekly", "monthly"] = "monthly"
+    horizon: int = 18
+    max_keys: int = 500
+    use_cleansed: bool = False  # reserved / future use
+
+
+class Run18mByQueryResult(BaseModel):
+    query: str
+    period: Literal["daily", "weekly", "monthly"] = "monthly"
+    horizon: int
+    keys_scanned: int
+    keys_forecasted: int
+    skipped: int
+    series: List[SeriesPoint]
+
+
+def _step_dates(last_dt: datetime, period: str, step_index: int) -> datetime:
+    """Return forecast bucket StartDate for step_index (1-based) after last_dt."""
+    if period == "daily":
+        return last_dt + timedelta(days=step_index)
+    if period == "weekly":
+        return last_dt + timedelta(days=7 * step_index)
+    # monthly
+    return (last_dt + pd.DateOffset(months=step_index)).to_pydatetime()
+
+
+@app.post("/api/forecast/18m/run-by-key", response_model=Run18mResult)
+def run_18m_by_key(body: Run18mBody):
+    """
+    Per-key interactive forecast using the appropriate module for the period:
+      - daily_mod for daily (7d horizon typical)
+      - weekly_mod for weekly (13w horizon typical)
+      - bf (monthly_mod) for monthly (18m horizon typical)
+    """
+    period: Literal["daily", "weekly", "monthly"] = body.period or "monthly"
+    mod = _get_forecast_module(period)
+
+    # Use reasonable default horizon per period if caller passes <=0 or default 18
+    default_H = DEFAULT_HORIZON[period]
+    raw_H = body.horizon or default_H
+    H = int(raw_H if raw_H > 0 else default_H)
+
+    pid, cid, lid = body.key.ProductID, body.key.ChannelID, body.key.LocationID
+
+    # Load series from the appropriate history table
+    series, _, _, _ = _load_series_for_key(period, pid, cid, lid, body.use_cleansed)
+
+    MIN_TRAIN = int(max(10, getattr(mod, "MIN_TRAIN_POINTS", 10)))
+    if len(series) < MIN_TRAIN:
+        raise HTTPException(status_code=400, detail=f"Not enough {period} history (have {len(series)}).")
+
+    # Model selection knobs from the module
+    METRIC = getattr(mod, "METRIC", "WMAPE")
+    FAST_MODE = getattr(mod, "FAST_MODE", True)
+    CV_STRIDE = getattr(mod, "CV_STRIDE", 2)
+    SNAIVE_PREF = getattr(mod, "SNAIVE_PREFERENCE_MARGIN", 0.05)
+
+    # Rolling backtest with registry models + snaive
+    preds_dict, scores, _ = mod.rolling_backtest(series, METRIC, CV_STRIDE if FAST_MODE else 1)
+
+    # Pick best model with SNaive preference rule
+    metric_key = "WMAPE" if (METRIC or "").upper() == "WMAPE" else "MAE"
+    best_model = min(scores.items(), key=lambda kv: kv[1][metric_key])[0]
+    best_score = scores[best_model][metric_key]
+    if "snaive" in scores and best_model != "snaive":
+        snaive_score = scores["snaive"][metric_key]
+        if not np.isinf(snaive_score):
+            gain = snaive_score - best_score
+            if gain < SNAIVE_PREF * snaive_score:
+                best_model = "snaive"
+
+    # Forward forecast using that module
+    fut_vals = mod.forward_forecast_best(series, best_model, horizon=H)
+
+    # Build time windows according to period
+    last_dt = series.index.max().to_pydatetime()
+    preds: List[Run18mPrediction] = []
+    for i in range(1, H + 1):
+        sdt = _step_dates(last_dt, period, i)
+        edt = _period_end(sdt, period)
+        preds.append(Run18mPrediction(
+            ProductID=pid, ChannelID=cid, LocationID=lid,
+            StartDate=sdt.strftime("%Y-%m-%dT00:00:00Z"),
+            EndDate=edt.strftime("%Y-%m-%dT23:59:59Z"),
+            Qty=float(fut_vals[i-1]),
+            Method=best_model,
+            Period=period.capitalize(),
+            Type="Algorithm-Forecast",
+        ))
+
+    # Optional: save to forecast_* table
+    if body.save and preds:
+        tbl = _forecast_table(period)
+        sql_ins = f"""
+        INSERT INTO {tbl}
+          ("ProductID","ChannelID","LocationID","StartDate","EndDate","Qty","Level","Period","Method","Type")
+        VALUES
+          (:ProductID,:ChannelID,:LocationID,:StartDate,:EndDate,:Qty,'Item',:Period,:Method,:Type)
+        ON CONFLICT ("ProductID","ChannelID","LocationID","StartDate","EndDate","Method")
+        DO UPDATE SET "Qty"=EXCLUDED."Qty","Type"=EXCLUDED."Type","created_at"=now();
+        """
+        with engine.begin() as c:
+            c.execute(text(sql_ins), [p.dict() for p in preds])
+
+    return Run18mResult(
+        key=body.key,
+        period=period,
+        model=best_model,
+        horizon=H,
+        history_points=int(len(series)),
+        predictions=preds
+    )
+
+
+@app.post("/api/forecast/18m/run-by-query", response_model=Run18mByQueryResult)
+def run_18m_by_query(body: Run18mByQueryBody):
+    """
+    For a query like 'productid:*' or 'productid:AztecWrap geography:Gelderland',
+    find all matching keys, run per-key forecasts using the same logic
+    for the chosen period (daily/weekly/monthly), and return the aggregate
+    (sum) series by StartDate.
+    """
+    period: Literal["daily", "weekly", "monthly"] = body.period or "monthly"
+    mod = _get_forecast_module(period)
+
+    default_H = DEFAULT_HORIZON[period]
+    raw_H = body.horizon or default_H
+    H = int(raw_H if raw_H > 0 else default_H)
+
+    # 1) Collect keys matching the query (limit by max_keys)
+    params: Dict[str, Any] = {}
+    where_sql = _build_where_clause_with_map(body.q or "", params, FIELD_MAP, bind_prefix="b")
+    params.update({"limit": int(max(1, min(body.max_keys, 5000)))})
+    keys_sql = f"""
+      SELECT DISTINCT fe."ProductID", fe."ChannelID", fe."LocationID"
+      FROM forecast_element fe
+      LEFT JOIN product  p ON p."ProductID"  = fe."ProductID"
+      LEFT JOIN channel  c ON c."ChannelID"  = fe."ChannelID"
+      LEFT JOIN location l ON l."LocationID" = fe."LocationID"
+      WHERE {where_sql}
+      ORDER BY fe."ProductID", fe."ChannelID", fe."LocationID"
+      LIMIT :limit
+    """
+    with engine.begin() as conn:
+        key_rows = conn.execute(text(keys_sql), params).mappings().all()
+
+    keys_scanned = len(key_rows)
+    if not keys_scanned:
+        return Run18mByQueryResult(
+            query=body.q or "",
+            period=period,
+            horizon=H,
+            keys_scanned=0, keys_forecasted=0, skipped=0,
+            series=[]
+        )
+
+    # 2) Per-key forecast, then aggregate by StartDate
+    METRIC = getattr(mod, "METRIC", "WMAPE")
+    FAST_MODE = getattr(mod, "FAST_MODE", True)
+    CV_STRIDE = getattr(mod, "CV_STRIDE", 2)
+    SNAIVE_PREF = getattr(mod, "SNAIVE_PREFERENCE_MARGIN", 0.05)
+    MIN_TRAIN = int(max(10, getattr(mod, "MIN_TRAIN_POINTS", 10)))
+
+    agg: Dict[str, float] = {}
+    keys_ok = 0
+    skipped = 0
+
+    for r in key_rows:
+        pid, cid, lid = str(r["ProductID"]), str(r["ChannelID"]), str(r["LocationID"])
+        try:
+            series, _, _, _ = _load_series_for_key(period, pid, cid, lid, body.use_cleansed)
+            if len(series) < MIN_TRAIN:
+                skipped += 1
+                continue
+
+            # pick best model via rolling backtest
+            preds_dict, scores, _ = mod.rolling_backtest(series, METRIC, CV_STRIDE if FAST_MODE else 1)
+            metric_key = "WMAPE" if (METRIC or "").upper() == "WMAPE" else "MAE"
+            best_model = min(scores.items(), key=lambda kv: kv[1][metric_key])[0]
+            best_score = scores[best_model][metric_key]
+            if "snaive" in scores and best_model != "snaive":
+                snaive_score = scores["snaive"][metric_key]
+                if not np.isinf(snaive_score):
+                    gain = snaive_score - best_score
+                    if gain < SNAIVE_PREF * snaive_score:
+                        best_model = "snaive"
+
+            fut_vals = mod.forward_forecast_best(series, best_model, horizon=H)
+
+            # Anchor buckets from this key's last history point
+            last_dt = series.index.max().to_pydatetime()
+            for i in range(1, H + 1):
+                sdt = _step_dates(last_dt, period, i)
+                start_str = sdt.strftime("%Y-%m-%dT00:00:00Z")
+                agg[start_str] = agg.get(start_str, 0.0) + float(fut_vals[i-1])
+
+            keys_ok += 1
+
+        except Exception:
+            skipped += 1
+            continue
+
+    # 3) Build aggregated series (sorted)
+    out_series = [
+        SeriesPoint(StartDate=k, Qty=v) for k, v in sorted(agg.items(), key=lambda kv: kv[0])
+    ]
+
+    return Run18mByQueryResult(
+        query=body.q or "",
+        period=period,
+        horizon=H,
+        keys_scanned=keys_scanned,
+        keys_forecasted=keys_ok,
+        skipped=skipped,
+        series=out_series
+    )
