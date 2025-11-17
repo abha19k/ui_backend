@@ -72,10 +72,11 @@ app.add_middleware(
 DB_URI = "postgresql://abha:planwise123@localhost:5432/planwise"
 engine = create_engine(DB_URI, pool_pre_ping=True)
 
-
 def fetch_all(query: str, params: dict | None = None):
     with engine.begin() as conn:
         res = conn.execute(text(query), params or {})
+        if not res.returns_rows:
+            return []
         return [dict(row._mapping) for row in res]
 
 
@@ -380,14 +381,20 @@ def list_saved():
         ORDER BY created_at DESC
     """)
 
-
 @app.post("/api/saved-searches")
 def save_search(item: dict = Body(...)):
     name = (item.get("name") or "").strip()
     query = (item.get("query") or "").strip()
     if not name or not query:
         raise HTTPException(status_code=400, detail="name and query are required")
-    fetch_all("INSERT INTO saved_search(name, query) VALUES (:name, :query)", {"name": name, "query": query})
+
+    # Use a plain execute for INSERT (no rows expected)
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO saved_search(name, query) VALUES (:name, :query)"),
+            {"name": name, "query": query},
+        )
+
     return {"ok": True}
 
 
@@ -1113,6 +1120,7 @@ class Run18mByQueryBody(BaseModel):
     horizon: int = 18
     max_keys: int = 500
     use_cleansed: bool = False  # reserved / future use
+    save: bool = False          # NEW: save per-key forecasts into forecast_*
 
 
 class Run18mByQueryResult(BaseModel):
@@ -1204,14 +1212,19 @@ def run_18m_by_key(body: Run18mBody):
         tbl = _forecast_table(period)
         sql_ins = f"""
         INSERT INTO {tbl}
-          ("ProductID","ChannelID","LocationID","StartDate","EndDate","Qty","Level","Period","Method","Type")
+          ("ProductID","ChannelID","LocationID","Method","Period","StartDate","EndDate","Type","Qty","Level")
         VALUES
-          (:ProductID,:ChannelID,:LocationID,:StartDate,:EndDate,:Qty,'Item',:Period,:Method,:Type)
+          (:ProductID,:ChannelID,:LocationID,:Method,:Period,:StartDate,:EndDate,:Type,:Qty,'Item')
         ON CONFLICT ("ProductID","ChannelID","LocationID","StartDate","EndDate","Method")
-        DO UPDATE SET "Qty"=EXCLUDED."Qty","Type"=EXCLUDED."Type","created_at"=now();
+        DO UPDATE SET
+          "Qty" = EXCLUDED."Qty",
+          "Type" = EXCLUDED."Type",
+          "created_at" = now();
         """
         with engine.begin() as c:
             c.execute(text(sql_ins), [p.dict() for p in preds])
+
+
 
     return Run18mResult(
         key=body.key,
@@ -1230,6 +1243,10 @@ def run_18m_by_query(body: Run18mByQueryBody):
     find all matching keys, run per-key forecasts using the same logic
     for the chosen period (daily/weekly/monthly), and return the aggregate
     (sum) series by StartDate.
+
+    If save=True, per-key forecasts are also upserted into forecast_daily /
+    forecast_weekly / forecast_monthly with ProductID, ChannelID, LocationID
+    and StartDate/EndDate/Method.
     """
     period: Literal["daily", "weekly", "monthly"] = body.period or "monthly"
     mod = _get_forecast_module(period)
@@ -1275,6 +1292,7 @@ def run_18m_by_query(body: Run18mByQueryBody):
     agg: Dict[str, float] = {}
     keys_ok = 0
     skipped = 0
+    all_save_rows: List[Dict[str, Any]] = []
 
     for r in key_rows:
         pid, cid, lid = str(r["ProductID"]), str(r["ChannelID"]), str(r["LocationID"])
@@ -1302,14 +1320,46 @@ def run_18m_by_query(body: Run18mByQueryBody):
             last_dt = series.index.max().to_pydatetime()
             for i in range(1, H + 1):
                 sdt = _step_dates(last_dt, period, i)
+                edt = _period_end(sdt, period)
                 start_str = sdt.strftime("%Y-%m-%dT00:00:00Z")
                 agg[start_str] = agg.get(start_str, 0.0) + float(fut_vals[i-1])
+
+                if body.save:
+                    all_save_rows.append({
+                        "ProductID": pid,
+                        "ChannelID": cid,
+                        "LocationID": lid,
+                        "StartDate": start_str,
+                        "EndDate": edt.strftime("%Y-%m-%dT23:59:59Z"),
+                        "Qty": float(fut_vals[i-1]),
+                        "Period": period.capitalize(),
+                        "Method": best_model,
+                        "Type": "Algorithm-Forecast",
+                    })
 
             keys_ok += 1
 
         except Exception:
             skipped += 1
             continue
+
+    # 2b) Save per-key forecasts if requested
+    if body.save and all_save_rows:
+        tbl = _forecast_table(period)
+        sql_ins = f"""
+        INSERT INTO {tbl}
+          ("ProductID","ChannelID","LocationID","Method","Period","StartDate","EndDate","Type","Qty","Level")
+        VALUES
+          (:ProductID,:ChannelID,:LocationID,:Method,:Period,:StartDate,:EndDate,:Type,:Qty,'Item')
+        ON CONFLICT ("ProductID","ChannelID","LocationID","StartDate","EndDate","Method")
+        DO UPDATE SET
+          "Qty" = EXCLUDED."Qty",
+          "Type" = EXCLUDED."Type",
+          "created_at" = now();
+        """
+        with engine.begin() as c:
+            c.execute(text(sql_ins), all_save_rows)
+
 
     # 3) Build aggregated series (sorted)
     out_series = [
