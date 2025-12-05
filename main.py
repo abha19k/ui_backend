@@ -431,6 +431,17 @@ def startup_ddl():
         """
             )
         )
+        # cleansed history tables (structure cloned from raw history)
+        c.execute(
+            text(
+                """
+        CREATE TABLE IF NOT EXISTS history_cleansed_daily   (LIKE history_daily   INCLUDING ALL);
+        CREATE TABLE IF NOT EXISTS history_cleansed_weekly  (LIKE history_weekly  INCLUDING ALL);
+        CREATE TABLE IF NOT EXISTS history_cleansed_monthly (LIKE history_monthly INCLUDING ALL);
+        """
+            )
+        )
+
         # forecast created_at + unique
         c.execute(
             text(
@@ -2203,7 +2214,8 @@ def _load_series_for_key(
     lid: str,
     want_cleansed: bool,
 ) -> Tuple[pd.Series, bool, str, str]:
-    hist_table, pd_freq, trunc_part = _tbl_freq(period)
+    base_table, pd_freq, trunc_part = _tbl_freq(period)
+    hist_table = f"history_cleansed_{period}" if want_cleansed else base_table
 
     def run_query(extra_where: str):
         sql = f"""
@@ -2385,16 +2397,34 @@ def history_ingest_cleansed(body: Union[List[IngestRow], IngestRow, dict] = Body
         for bucket, batch in groups.items():
             if not batch:
                 continue
-            table = _tbl_freq(bucket)[0]
+
+            raw_table = _tbl_freq(bucket)[0]                  # history_daily / weekly / monthly
+            cleansed_table = f"history_cleansed_{bucket}"     # history_cleansed_daily / ...
+
+            # 1) insert into cleansed history (used by classification)
             c.execute(
                 text(
                     f"""
-                INSERT INTO {table}("ProductID","ChannelID","LocationID","StartDate","Qty")
+                INSERT INTO {cleansed_table}
+                  ("ProductID","ChannelID","LocationID","StartDate","Qty")
                 VALUES (:ProductID,:ChannelID,:LocationID,:StartDate,:Qty)
-            """
+                """
                 ),
                 batch,
             )
+
+            # 2) (optional) also store into raw history, if you want it there
+            c.execute(
+                text(
+                    f"""
+                INSERT INTO {raw_table}
+                  ("ProductID","ChannelID","LocationID","StartDate","Qty")
+                VALUES (:ProductID,:ChannelID,:LocationID,:StartDate,:Qty)
+                """
+                ),
+                batch,
+            )
+
             inserted += len(batch)
 
     return {"inserted": inserted, "errors": errors}
@@ -2407,34 +2437,51 @@ class ClassifyRequest(BaseModel):
     min_sum: float = 1.0
     include_inactive: bool = False  # for GET only
 
-
 @app.post("/api/classify/compute")
 def classify_compute(body: ClassifyRequest):
-    hist_table, _, trunc_part = _tbl_freq(body.period)
+    base_table, _, trunc_part = _tbl_freq(body.period)  # base history_* table + trunc_part
+    hist_table_cleansed = f"history_cleansed_{body.period}"
     unit = {"daily": "day", "weekly": "week", "monthly": "month"}[body.period]
 
-    raw = fetch_all(
-        f"""
-      WITH raw AS (
-        SELECT h."ProductID", h."ChannelID", h."LocationID",
-               date_trunc(:trunc_part, {_ts_expr('h')}) AS dt,
-               SUM(h."Qty")::float AS qty
-        FROM {hist_table} h
-        WHERE {_ts_expr('h')} IS NOT NULL
-        GROUP BY 1,2,3,4
-      ),
-      recent AS (
-        SELECT r."ProductID", r."ChannelID", r."LocationID",
-               SUM(r.qty) AS s,
-               MAX(r.dt)  AS last_dt
-        FROM raw r
-        WHERE r.dt >= (SELECT MAX(dt) FROM raw) - (:lb - 1) * INTERVAL '1 {unit}'
-        GROUP BY 1,2,3
-      )
-      SELECT * FROM recent
-        """,
-        {"trunc_part": trunc_part, "lb": int(max(1, body.lookback_buckets))},
-    )
+    def _run_recent_from(table_name: str):
+        return fetch_all(
+            f"""
+          WITH raw AS (
+            SELECT h."ProductID", h."ChannelID", h."LocationID",
+                   date_trunc(:trunc_part, {_ts_expr('h')}) AS dt,
+                   SUM(h."Qty")::float AS qty
+            FROM {table_name} h
+            WHERE {_ts_expr('h')} IS NOT NULL
+            GROUP BY 1,2,3,4
+          ),
+          recent AS (
+            SELECT r."ProductID", r."ChannelID", r."LocationID",
+                   SUM(r.qty) AS s,
+                   MAX(r.dt)  AS last_dt
+            FROM raw r
+            WHERE r.dt >= (
+                SELECT MAX(dt) FROM raw
+            ) - (:lb - 1) * INTERVAL '1 {unit}'
+            GROUP BY 1,2,3
+          )
+          SELECT * FROM recent
+            """,
+            {"trunc_part": trunc_part, "lb": int(max(1, body.lookback_buckets))},
+        )
+
+    # 1) Try cleansed table first
+    raw = _run_recent_from(hist_table_cleansed)
+
+    # 2) If no cleansed history, fall back to base history table
+    if not raw:
+        raw = _run_recent_from(base_table)
+
+    # 3) If still nothing, then really no history for this period
+    if not raw:
+        raise HTTPException(
+            status_code=400,
+            detail="No Cleansed-History found for this period. Please run Cleanse History first.",
+        )
 
     upserts = []
     for r in raw:
@@ -2455,36 +2502,52 @@ def classify_compute(body: ClassifyRequest):
     if upserts:
         with engine.begin() as c:
             c.execute(
-                text(
-                    """
-              INSERT INTO forecast_element_classification
-                ("ProductID","ChannelID","LocationID","Period","Label","Score","IsActive","ComputedAt")
-              VALUES
-                (:ProductID,:ChannelID,:LocationID,:Period,:Label,:Score,:IsActive, now())
-              ON CONFLICT ("ProductID","ChannelID","LocationID","Period")
-              DO UPDATE SET
-                "Label"=EXCLUDED."Label",
-                "Score"=EXCLUDED."Score",
-                "IsActive"=EXCLUDED."IsActive",
-                "ComputedAt"=now()
-            """
-                ),
+                text("""
+          INSERT INTO forecast_element_classification
+            ("ProductID","ChannelID","LocationID","Period","Label","Score","IsActive")
+          VALUES
+            (:ProductID,:ChannelID,:LocationID,:Period,:Label,:Score,:IsActive)
+          ON CONFLICT ("ProductID","ChannelID","LocationID","Period")
+          DO UPDATE SET
+            "Label"     = EXCLUDED."Label",
+            "Score"     = EXCLUDED."Score",
+            "IsActive"  = EXCLUDED."IsActive",
+            "ComputedAt" = now()
+                          """),
                 upserts,
             )
 
     return {"updated": len(upserts), "period": body.period}
 
 
+
 @app.get("/api/classify/results")
 def classify_results(period: Literal["daily", "weekly", "monthly"], include_inactive: bool = False):
-    filt = "" if include_inactive else 'AND "IsActive" = TRUE'
-    sql = f"""
-      SELECT "ProductID","ChannelID","LocationID","Period","Label","Score","IsActive","ComputedAt"
+    sql = """
+      SELECT
+        "ProductID",
+        "ChannelID",
+        "LocationID",
+        "Period",
+        "Label"     AS "Label",
+        "Score"     AS "Score",
+        "IsActive"  AS "IsActive",
+        "ComputedAt"
       FROM forecast_element_classification
-      WHERE "Period" = :p {filt}
-      ORDER BY "IsActive" DESC, "Score" DESC, "ProductID","ChannelID","LocationID"
+      WHERE "Period" = :p
     """
+    if not include_inactive:
+        sql += " AND \"IsActive\" = TRUE"
+
+    sql += """
+      ORDER BY "IsActive" DESC, "Score" DESC,
+               "ProductID","ChannelID","LocationID"
+    """
+
     return fetch_all(sql, {"p": period})
+
+
+
 
 
 # === Batch 18M (monthly CSV-driven) ==========================================
